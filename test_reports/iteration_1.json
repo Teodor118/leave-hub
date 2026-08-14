@@ -1,0 +1,28 @@
+{
+  "summary": "Smoke test of TurismERP (Romanian travel agency). Backend auth, CRUD listing, atomic seat logic, payment/overpay validation, status transitions all verified against public URL. Frontend login → dashboard → all 8 nav sections loaded with seeded data and charts render.",
+  "tested_scope": ["backend", "frontend", "auth", "integration"],
+  "passed": [
+    "POST /api/auth/login with correct credentials returns JWT + user",
+    "POST /api/auth/login with wrong password returns 401 'Email sau parolă incorecte'",
+    "GET /api/auth/me returns current user with Bearer token",
+    "GET /api/clients (10), /api/employees (5), /api/destinations (5), /api/packages (8) all return seed data",
+    "Packages include joined destination object (destination key populated)",
+    "Reports dashboard returns kpi, reservations_per_client, popular_packages, revenue_by_method",
+    "POST /api/clients duplicate email → 400 'Există deja un client cu acest email'",
+    "POST /api/employees salariu=1000 rejected by pydantic (ge=2500)",
+    "POST /api/reservations happy path: 2 pax x 4500 RON = valoare 9000, locuri 11→9",
+    "POST /api/reservations overbook (20 pax on 9 remaining) → 400 'Locuri insuficiente pentru acest pachet'",
+    "POST /api/payments partial (4000/9000) 200; overpay → 400 'Suma depășește soldul rămas (5000.00 RON)'",
+    "PUT /api/reservations/{id}/status ANULATA restores locuri 9→11 (uses body key 'stare')",
+    "DELETE /api/reservations/{id} cascades cleanly (200 ok:true)",
+    "Frontend: login page renders, submitting credentials navigates to /dashboard",
+    "Dashboard shows KPIs (Rezervări totale 10, Venit 41.700 RON, Clienți 8, Pachete 8) and Recharts (Pachete populare, Venit per metodă)",
+    "Sidebar navigation to Clienți, Rezervări, Pachete, Rapoarte works; tables populated (10/10/8/8 rows) with no error elements"
+  ],
+  "failed": [],
+  "action_items": [],
+  "success_rate": {"backend": "100%", "frontend": "100%"},
+  "retest_needed": false,
+  "full_testing_deferred": true,
+  "notes": "Reservation status PUT expects body {\"stare\": \"ANULATA\"} (not \"status\"); confirmed by server.py. Employee salariu and numar_persoane validations are pydantic-level (422), Romanian domain errors (email duplicate, locuri insuficiente, overpay) return 400 with Romanian text as specified."
+}

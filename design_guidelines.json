@@ -1,0 +1,166 @@
+{
+  "project_name": "Aplicație Agenție de Turism (Staff-Only ERP)",
+  "language": "ro",
+  "app_type": "dashboard",
+  "theme": {
+    "mode": "light",
+    "primary_color": "#2563eb",
+    "primary_hover": "#1d4ed8",
+    "primary_light": "#eff6ff",
+    "accent_color": "#0284c7",
+    "success_color": "#16a34a",
+    "warning_color": "#d97706",
+    "danger_color": "#dc2626",
+    "neutral_bg": "#f8fafc",
+    "card_bg": "#ffffff",
+    "border_color": "#e2e8f0",
+    "text_main": "#0f172a",
+    "text_muted": "#64748b"
+  },
+  "typography": {
+    "heading_font": "Satoshi, Cabinet Grotesk, Work Sans, sans-serif",
+    "body_font": "Inter, IBM Plex Sans, sans-serif",
+    "mono_font": "JetBrains Mono, monospace",
+    "scale": {
+      "h1": "text-3xl font-bold tracking-tight text-slate-900",
+      "h2": "text-2xl font-semibold tracking-tight text-slate-900",
+      "h3": "text-xl font-semibold text-slate-900",
+      "subheading": "text-sm font-medium text-slate-500",
+      "body": "text-sm text-slate-700 leading-normal",
+      "caption": "text-xs text-slate-500"
+    }
+  },
+  "spacing_and_layout": {
+    "container_padding": "p-6 lg:p-8",
+    "card_padding": "p-5",
+    "grid_density": "High Density Grid - Mode B (Dashboard)",
+    "gap": "gap-4 md:gap-6",
+    "sidebar_width": "w-64",
+    "header_height": "h-16"
+  },
+  "visual_enhancers": {
+    "borders": "1px solid #e2e8f0 with rounded-lg (8px max radius)",
+    "shadows": "shadow-sm border border-slate-200/80 hover:shadow-md transition-shadow duration-200",
+    "glassmorphism": "backdrop-blur-md bg-white/80 border-b border-slate-200 sticky top-0 z-40",
+    "forbidden_styles": [
+      "No full screen dark gradients",
+      "No transparent dropdown/modal backgrounds",
+      "No Space Grotesk font",
+      "No Teal blue/green #1B93A4 color",
+      "No marketing fluff or overly wide cards"
+    ]
+  },
+  "key_features_and_modules": [
+    {
+      "module": "Autentificare Staff (Login)",
+      "route": "/login",
+      "components": ["Card", "Input", "Button", "Label", "Alert"],
+      "test_ids": {
+        "email": "login-email-input",
+        "password": "login-password-input",
+        "submit": "login-submit-button",
+        "error": "login-error-message"
+      }
+    },
+    {
+      "module": "Tablou de comandă (Dashboard)",
+      "route": "/dashboard",
+      "components": ["StatsCards", "RechartsReservations", "RechartsPackages", "RechartsRevenue"],
+      "test_ids": {
+        "kpi_reservations": "kpi-total-reservations",
+        "kpi_revenue": "kpi-total-revenue",
+        "kpi_active_clients": "kpi-active-clients",
+        "chart_reservations_per_client": "chart-reservations-per-client",
+        "chart_popular_packages": "chart-popular-packages",
+        "chart_revenue_by_method": "chart-revenue-by-payment-method"
+      }
+    },
+    {
+      "module": "Gestionare Clienți (Clients CRUD)",
+      "route": "/clients",
+      "fields": ["nume", "prenume", "email", "telefon", "data_inregistrarii", "statut (ACTIV/INACTIV)"],
+      "test_ids": {
+        "add_button": "client-add-button",
+        "table": "clients-table",
+        "search_input": "client-search-input",
+        "status_badge": "client-status-badge"
+      }
+    },
+    {
+      "module": "Gestionare Angajați (Employees CRUD)",
+      "route": "/employees",
+      "fields": ["nume", "prenume", "rol", "salariu (>=2500)", "data_angajarii"],
+      "test_ids": {
+        "add_button": "employee-add-button",
+        "table": "employees-table",
+        "salary_input": "employee-salary-input"
+      }
+    },
+    {
+      "module": "Gestionare Destinații (Destinations CRUD)",
+      "route": "/destinations",
+      "types": ["MARE", "MUNTE", "CITY BREAK", "CULTURAL"],
+      "test_ids": {
+        "add_button": "destination-add-button",
+        "type_filter": "destination-type-filter",
+        "table": "destinations-table"
+      }
+    },
+    {
+      "module": "Gestionare Pachete (Packages CRUD)",
+      "route": "/packages",
+      "fields": ["destination_id", "denumire", "pret (>0)", "durata_zile (1-30)", "locuri_disponibile (>=0)"],
+      "test_ids": {
+        "add_button": "package-add-button",
+        "table": "packages-table",
+        "seats_available": "package-seats-display"
+      }
+    },
+    {
+      "module": "Gestionare Rezervări (Reservations Management)",
+      "route": "/reservations",
+      "fields": ["client_id", "package_id", "employee_id", "numar_persoane (1-20)", "stare (CONFIRMATA/ANULATA/FINALIZATA)"],
+      "business_rules": "Scădere atomică a locurilor disponibile la confirmare / reintregire la anulare.",
+      "test_ids": {
+        "add_button": "reservation-add-button",
+        "table": "reservations-table",
+        "status_select": "reservation-status-select",
+        "persons_input": "reservation-persons-input"
+      }
+    },
+    {
+      "module": "Gestionare Plăți (Payments & Balances)",
+      "route": "/payments",
+      "methods": ["CARD", "CASH", "TRANSFER"],
+      "business_rules": "Plăți parțiale per rezervare, afișare dinamica sold rămas de achitat.",
+      "test_ids": {
+        "add_button": "payment-add-button",
+        "table": "payments-table",
+        "amount_input": "payment-amount-input",
+        "method_select": "payment-method-select",
+        "remaining_balance": "payment-remaining-balance"
+      }
+    },
+    {
+      "module": "Rapoarte (Reports)",
+      "route": "/reports",
+      "components": ["AggregatedTable", "RevenueChart", "ExportButton"],
+      "test_ids": {
+        "reports_table": "reports-aggregated-table",
+        "export_pdf_button": "reports-export-pdf-button"
+      }
+    }
+  ],
+  "image_urls": {
+    "sea_destination": "https://images.unsplash.com/photo-1605538108568-7f0d77a214c1?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NTYxODh8MHwxfHNlYXJjaHwxfHx0cm9waWNhbCUyMGJlYWNoJTIwcmVzb3J0fGVufDB8fHx8MTc4NjczNTkwOHww&ixlib=rb-4.1.0&q=85",
+    "mountain_destination": "https://images.unsplash.com/photo-1630404356140-3825a5f74992?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1NjZ8MHwxfHNlYXJjaHwyfHxtb3VudGFpbiUyMEFscHMlMjBsYW5kc2NhcGUlMjByZXNvcnR8ZW58MHx8fHwxNzg2NzM1OTExfDA&ixlib=rb-4.1.0&q=85",
+    "city_break_destination": "https://images.unsplash.com/photo-1627448449276-8c139d0790a6?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NTYxODh8MHwxfHNlYXJjaHwyfHx0cm9waWNhbCUyMGJlYWNoJTIwcmVzb3J0fGVufDB8fHx8MTc4NjczNTkwOHww&ixlib=rb-4.1.0&q=85"
+  },
+  "instructions_to_main_agent": [
+    "Use Shadcn UI components for form inputs, modals, select dropdowns, tables, cards and tabs.",
+    "Strictly format all currency values as 'RON' or 'lei' (e.g. 2.500 RON).",
+    "Ensure all form validation error messages are clear and written strictly in Romanian (e.g., 'Salariul minim este de 2500 RON', 'Locuri insuficiente').",
+    "All table actions (Edit, Delete, Change Status, Add Payment) must have data-testid attributes.",
+    "Maintain responsive sidebar navigation with collapse support for small screens."
+  ]
+}

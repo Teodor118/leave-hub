@@ -1,0 +1,12 @@
+html, body, #root {
+  height: 100%;
+}
+body {
+  background-color: #f8fafc;
+  color: #0f172a;
+  font-family: 'Inter', 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+}
+h1, h2, h3, h4 {
+  font-family: 'Cabinet Grotesk', 'Satoshi', 'Work Sans', 'Inter', sans-serif;
+  letter-spacing: -0.01em;
+}
