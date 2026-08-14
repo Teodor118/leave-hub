@@ -1,10 +1,9 @@
-html, body, #root {
-  height: 100%;
-}
+html, body, #root { height: 100%; }
 body {
   background-color: #f8fafc;
   color: #0f172a;
   font-family: 'Inter', 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
 }
 h1, h2, h3, h4 {
   font-family: 'Cabinet Grotesk', 'Satoshi', 'Work Sans', 'Inter', sans-serif;

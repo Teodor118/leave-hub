@@ -5,19 +5,26 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 import os
+import io
+import base64
 import logging
-import random
 import bcrypt
 import jwt
 from datetime import datetime, timezone, timedelta, date
-from typing import List, Optional, Annotated
+from typing import List, Optional
 from bson import ObjectId
 from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request
+from fastapi.responses import Response
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel, Field, EmailStr, ConfigDict, BeforeValidator, field_validator
+from pydantic import BaseModel, Field, EmailStr, field_validator
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+from reportlab.lib.units import cm
 
-# ---------- Setup ----------
+# --------- Setup ---------
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ['DB_NAME']]
@@ -29,18 +36,36 @@ app = FastAPI()
 api = APIRouter(prefix="/api")
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+log = logging.getLogger(__name__)
+
+# --------- Romania Public Holidays 2025-2026 ---------
+RO_HOLIDAYS = {
+    # 2025
+    "2025-01-01", "2025-01-02", "2025-01-06", "2025-01-07", "2025-01-24",
+    "2025-04-18", "2025-04-20", "2025-04-21", "2025-05-01",
+    "2025-06-01", "2025-06-08", "2025-06-09", "2025-08-15",
+    "2025-11-30", "2025-12-01", "2025-12-25", "2025-12-26",
+    # 2026
+    "2026-01-01", "2026-01-02", "2026-01-06", "2026-01-07", "2026-01-24",
+    "2026-04-10", "2026-04-12", "2026-04-13", "2026-05-01",
+    "2026-05-31", "2026-06-01", "2026-08-15",
+    "2026-11-30", "2026-12-01", "2026-12-25", "2026-12-26",
+}
 
 
-# ---------- Helpers ----------
-def to_object_id(v):
-    if isinstance(v, ObjectId):
-        return str(v)
-    return str(v)
+def calc_working_days(start: date, end: date) -> int:
+    if end < start:
+        return 0
+    days = 0
+    cur = start
+    while cur <= end:
+        if cur.weekday() < 5 and cur.isoformat() not in RO_HOLIDAYS:
+            days += 1
+        cur += timedelta(days=1)
+    return days
 
-PyObjectId = Annotated[str, BeforeValidator(to_object_id)]
 
-
+# --------- Helpers ---------
 def hash_password(p: str) -> str:
     return bcrypt.hashpw(p.encode(), bcrypt.gensalt()).decode()
 
@@ -52,43 +77,21 @@ def verify_password(p: str, h: str) -> bool:
         return False
 
 
-def create_token(user_id: str, email: str) -> str:
-    payload = {
-        "sub": user_id,
-        "email": email,
-        "exp": datetime.now(timezone.utc) + timedelta(days=7),
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
-
-
-async def get_current_user(request: Request) -> dict:
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Neautentificat")
-    token = auth[7:]
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Sesiune expirată")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Token invalid")
-    user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
-    if not user:
-        raise HTTPException(status_code=401, detail="Utilizator inexistent")
-    user["id"] = str(user["_id"])
-    user.pop("_id", None)
-    user.pop("password_hash", None)
-    return user
+def create_token(uid: str, email: str, role: str) -> str:
+    return jwt.encode(
+        {"sub": uid, "email": email, "role": role,
+         "exp": datetime.now(timezone.utc) + timedelta(days=7)},
+        JWT_SECRET, algorithm=JWT_ALGO)
 
 
 def oid(x: str) -> ObjectId:
     try:
         return ObjectId(x)
     except Exception:
-        raise HTTPException(status_code=400, detail="ID invalid")
+        raise HTTPException(400, "ID invalid")
 
 
-def serialize_doc(doc: dict) -> dict:
+def ser(doc):
     if not doc:
         return doc
     doc["id"] = str(doc.pop("_id"))
@@ -98,646 +101,721 @@ def serialize_doc(doc: dict) -> dict:
     return doc
 
 
-# ---------- Models ----------
+async def get_user(request: Request) -> dict:
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(401, "Neautentificat")
+    try:
+        p = jwt.decode(auth[7:], JWT_SECRET, algorithms=[JWT_ALGO])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(401, "Sesiune expirată")
+    except jwt.InvalidTokenError:
+        raise HTTPException(401, "Token invalid")
+    u = await db.users.find_one({"_id": ObjectId(p["sub"])})
+    if not u:
+        raise HTTPException(401, "Utilizator inexistent")
+    u = ser(u)
+    u.pop("password_hash", None)
+    return u
+
+
+def require_role(*roles):
+    async def _check(user=Depends(get_user)):
+        if user["role"] not in roles:
+            raise HTTPException(403, "Acces interzis pentru rolul curent")
+        return user
+    return _check
+
+
+# --------- Models ---------
 class LoginIn(BaseModel):
     email: EmailStr
     password: str
 
 
-class ClientIn(BaseModel):
-    nume: str = Field(min_length=1, max_length=60)
-    prenume: str = Field(min_length=1, max_length=60)
+class UserIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
     email: EmailStr
-    telefon: str = Field(min_length=6, max_length=25)
-    statut: str = Field(default="ACTIV")
+    password: Optional[str] = Field(default=None, min_length=6)
+    role: str
+    dept_id: Optional[str] = None
+    annual_leave_days: int = Field(default=21, ge=0, le=60)
 
-    @field_validator("statut")
+    @field_validator("role")
     @classmethod
-    def v_statut(cls, v):
-        if v not in ("ACTIV", "INACTIV"):
-            raise ValueError("Statutul trebuie să fie ACTIV sau INACTIV")
+    def v_role(cls, v):
+        if v not in ("USER", "DEPT_RESP", "ADMIN"):
+            raise ValueError("Rol invalid")
         return v
 
 
-class EmployeeIn(BaseModel):
-    nume: str = Field(min_length=1, max_length=60)
-    prenume: str = Field(min_length=1, max_length=60)
-    functie: str = Field(min_length=1, max_length=60)
-    salariu: float = Field(ge=2500)
-    data_angajarii: Optional[str] = None
+class DepartmentIn(BaseModel):
+    department_name: str = Field(min_length=1, max_length=80)
+    manager_id: Optional[str] = None
+    max_absent_employees: int = Field(ge=1, le=100)
 
 
-class DestinationIn(BaseModel):
-    tara: str = Field(min_length=1, max_length=80)
-    oras: str = Field(min_length=1, max_length=80)
-    tip: str
-
-    @field_validator("tip")
-    @classmethod
-    def v_tip(cls, v):
-        if v not in ("MARE", "MUNTE", "CITY BREAK", "CULTURAL"):
-            raise ValueError("Tipul destinației este invalid")
-        return v
+class LeaveTypeIn(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    code: str = Field(min_length=1, max_length=20)
+    requires_attachment: bool = False
+    paid: bool = True
 
 
-class PackageIn(BaseModel):
-    destination_id: str
-    denumire: str = Field(min_length=1, max_length=120)
-    pret: float = Field(gt=0)
-    zile: int = Field(ge=1, le=30)
-    locuri_disponibile: int = Field(ge=0)
+class LeaveRequestIn(BaseModel):
+    leave_type_id: str
+    start_date: str  # YYYY-MM-DD
+    end_date: str
+    attachment: Optional[dict] = None  # {file_name, content_base64}
+    submit: bool = True  # True = PENDING, False = DRAFT
 
 
-class ReservationIn(BaseModel):
-    client_id: str
-    package_id: str
-    employee_id: str
-    numar_persoane: int = Field(ge=1, le=20)
+class LeaveActionIn(BaseModel):
+    action: str  # APPROVE / REJECT / CANCEL / SUBMIT
+    comment: Optional[str] = None
 
 
-class ReservationStatusIn(BaseModel):
-    stare: str
-
-    @field_validator("stare")
-    @classmethod
-    def v_st(cls, v):
-        if v not in ("CONFIRMATA", "ANULATA", "FINALIZATA"):
-            raise ValueError("Stare invalidă")
-        return v
-
-
-class PaymentIn(BaseModel):
-    reservation_id: str
-    suma: float = Field(gt=0)
-    metoda: str
-
-    @field_validator("metoda")
-    @classmethod
-    def v_m(cls, v):
-        if v not in ("CARD", "CASH", "TRANSFER"):
-            raise ValueError("Metoda de plată invalidă")
-        return v
-
-
-# ---------- Auth ----------
+# --------- Auth ---------
 @api.post("/auth/login")
 async def login(body: LoginIn):
     email = body.email.lower()
-    user = await db.users.find_one({"email": email})
-    if not user or not verify_password(body.password, user["password_hash"]):
-        raise HTTPException(status_code=401, detail="Email sau parolă incorecte")
-    token = create_token(str(user["_id"]), email)
+    u = await db.users.find_one({"email": email})
+    if not u or not verify_password(body.password, u["password_hash"]):
+        raise HTTPException(401, "Email sau parolă incorecte")
+    token = create_token(str(u["_id"]), email, u["role"])
     return {
         "token": token,
-        "user": {"id": str(user["_id"]), "email": email, "nume": user.get("nume", "Admin")},
+        "user": {
+            "id": str(u["_id"]), "email": email, "name": u["name"], "role": u["role"],
+            "dept_id": str(u.get("dept_id")) if u.get("dept_id") else None,
+            "annual_leave_days": u.get("annual_leave_days", 0),
+            "available_leave_days": u.get("available_leave_days", 0),
+        },
     }
 
 
 @api.get("/auth/me")
-async def me(user=Depends(get_current_user)):
+async def me(user=Depends(get_user)):
+    if user.get("dept_id"):
+        d = await db.departments.find_one({"_id": oid(user["dept_id"])})
+        user["department"] = ser(d) if d else None
     return user
 
 
-# ---------- Clients ----------
-@api.get("/clients")
-async def list_clients(q: Optional[str] = None, statut: Optional[str] = None, user=Depends(get_current_user)):
+# --------- Departments ---------
+@api.get("/departments")
+async def list_departments(user=Depends(get_user)):
+    docs = await db.departments.find({}).sort("department_name", 1).to_list(500)
+    out = []
+    for d in docs:
+        d = ser(d)
+        if d.get("manager_id"):
+            m = await db.users.find_one({"_id": oid(d["manager_id"])})
+            d["manager_name"] = m["name"] if m else None
+        d["employee_count"] = await db.users.count_documents({"dept_id": oid(d["id"])})
+        out.append(d)
+    return out
+
+
+@api.post("/departments")
+async def create_department(body: DepartmentIn, user=Depends(require_role("ADMIN"))):
+    doc = body.model_dump()
+    if doc.get("manager_id"):
+        doc["manager_id"] = oid(doc["manager_id"])
+    res = await db.departments.insert_one(doc)
+    return ser(await db.departments.find_one({"_id": res.inserted_id}))
+
+
+@api.put("/departments/{did}")
+async def update_department(did: str, body: DepartmentIn, user=Depends(require_role("ADMIN"))):
+    doc = body.model_dump()
+    doc["manager_id"] = oid(doc["manager_id"]) if doc.get("manager_id") else None
+    await db.departments.update_one({"_id": oid(did)}, {"$set": doc})
+    return ser(await db.departments.find_one({"_id": oid(did)}))
+
+
+@api.delete("/departments/{did}")
+async def del_department(did: str, user=Depends(require_role("ADMIN"))):
+    if await db.users.find_one({"dept_id": oid(did)}):
+        raise HTTPException(400, "Există angajați asociați acestui departament")
+    r = await db.departments.delete_one({"_id": oid(did)})
+    if r.deleted_count == 0:
+        raise HTTPException(404, "Departament inexistent")
+    return {"ok": True}
+
+
+# --------- Users (Admin) ---------
+@api.get("/users")
+async def list_users(dept_id: Optional[str] = None, user=Depends(get_user)):
     filt = {}
-    if statut and statut in ("ACTIV", "INACTIV"):
-        filt["statut"] = statut
-    if q:
-        filt["$or"] = [
-            {"nume": {"$regex": q, "$options": "i"}},
-            {"prenume": {"$regex": q, "$options": "i"}},
-            {"email": {"$regex": q, "$options": "i"}},
-        ]
-    docs = await db.clients.find(filt).sort("data_inregistrarii", -1).to_list(1000)
-    return [serialize_doc(d) for d in docs]
+    if dept_id:
+        filt["dept_id"] = oid(dept_id)
+    docs = await db.users.find(filt).sort("name", 1).to_list(500)
+    out = []
+    for d in docs:
+        d = ser(d)
+        d.pop("password_hash", None)
+        if d.get("dept_id"):
+            dep = await db.departments.find_one({"_id": oid(d["dept_id"])})
+            d["department_name"] = dep["department_name"] if dep else None
+        out.append(d)
+    return out
 
 
-@api.post("/clients")
-async def create_client(body: ClientIn, user=Depends(get_current_user)):
+@api.post("/users")
+async def create_user(body: UserIn, user=Depends(require_role("ADMIN"))):
     email = body.email.lower()
-    if await db.clients.find_one({"email": email}):
-        raise HTTPException(status_code=400, detail="Există deja un client cu acest email")
+    if await db.users.find_one({"email": email}):
+        raise HTTPException(400, "Există deja un utilizator cu acest email")
     doc = body.model_dump()
     doc["email"] = email
-    doc["data_inregistrarii"] = datetime.now(timezone.utc).isoformat()
-    res = await db.clients.insert_one(doc)
-    return serialize_doc(await db.clients.find_one({"_id": res.inserted_id}))
+    pwd = doc.pop("password") or "parola123"
+    doc["password_hash"] = hash_password(pwd)
+    doc["available_leave_days"] = doc["annual_leave_days"]
+    if doc.get("dept_id"):
+        doc["dept_id"] = oid(doc["dept_id"])
+    res = await db.users.insert_one(doc)
+    return ser(await db.users.find_one({"_id": res.inserted_id}))
 
 
-@api.put("/clients/{cid}")
-async def update_client(cid: str, body: ClientIn, user=Depends(get_current_user)):
-    email = body.email.lower()
-    exists = await db.clients.find_one({"email": email, "_id": {"$ne": oid(cid)}})
-    if exists:
-        raise HTTPException(status_code=400, detail="Există deja un client cu acest email")
+@api.put("/users/{uid}")
+async def update_user(uid: str, body: UserIn, user=Depends(require_role("ADMIN"))):
     doc = body.model_dump()
-    doc["email"] = email
-    await db.clients.update_one({"_id": oid(cid)}, {"$set": doc})
-    return serialize_doc(await db.clients.find_one({"_id": oid(cid)}))
+    doc["email"] = doc["email"].lower()
+    pwd = doc.pop("password", None)
+    if pwd:
+        doc["password_hash"] = hash_password(pwd)
+    doc["dept_id"] = oid(doc["dept_id"]) if doc.get("dept_id") else None
+    await db.users.update_one({"_id": oid(uid)}, {"$set": doc})
+    return ser(await db.users.find_one({"_id": oid(uid)}))
 
 
-@api.delete("/clients/{cid}")
-async def delete_client(cid: str, user=Depends(get_current_user)):
-    r = await db.clients.delete_one({"_id": oid(cid)})
+@api.delete("/users/{uid}")
+async def delete_user(uid: str, user=Depends(require_role("ADMIN"))):
+    r = await db.users.delete_one({"_id": oid(uid)})
     if r.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Client inexistent")
+        raise HTTPException(404, "Utilizator inexistent")
     return {"ok": True}
 
 
-# ---------- Employees ----------
-@api.get("/employees")
-async def list_employees(functie: Optional[str] = None, user=Depends(get_current_user)):
-    filt = {}
-    if functie:
-        filt["functie"] = functie
-    docs = await db.employees.find(filt).sort("nume", 1).to_list(1000)
-    return [serialize_doc(d) for d in docs]
+# --------- Leave Types ---------
+@api.get("/leave-types")
+async def list_leave_types(user=Depends(get_user)):
+    docs = await db.leave_types.find({}).sort("code", 1).to_list(100)
+    return [ser(d) for d in docs]
 
 
-@api.post("/employees")
-async def create_employee(body: EmployeeIn, user=Depends(get_current_user)):
+@api.post("/leave-types")
+async def create_leave_type(body: LeaveTypeIn, user=Depends(require_role("ADMIN"))):
+    if await db.leave_types.find_one({"code": body.code.upper()}):
+        raise HTTPException(400, "Există deja un tip de concediu cu acest cod")
     doc = body.model_dump()
-    if not doc.get("data_angajarii"):
-        doc["data_angajarii"] = datetime.now(timezone.utc).date().isoformat()
-    res = await db.employees.insert_one(doc)
-    return serialize_doc(await db.employees.find_one({"_id": res.inserted_id}))
+    doc["code"] = doc["code"].upper()
+    res = await db.leave_types.insert_one(doc)
+    return ser(await db.leave_types.find_one({"_id": res.inserted_id}))
 
 
-@api.put("/employees/{eid}")
-async def update_employee(eid: str, body: EmployeeIn, user=Depends(get_current_user)):
+@api.put("/leave-types/{lid}")
+async def update_leave_type(lid: str, body: LeaveTypeIn, user=Depends(require_role("ADMIN"))):
     doc = body.model_dump()
-    await db.employees.update_one({"_id": oid(eid)}, {"$set": doc})
-    return serialize_doc(await db.employees.find_one({"_id": oid(eid)}))
+    doc["code"] = doc["code"].upper()
+    await db.leave_types.update_one({"_id": oid(lid)}, {"$set": doc})
+    return ser(await db.leave_types.find_one({"_id": oid(lid)}))
 
 
-@api.delete("/employees/{eid}")
-async def delete_employee(eid: str, user=Depends(get_current_user)):
-    r = await db.employees.delete_one({"_id": oid(eid)})
+@api.delete("/leave-types/{lid}")
+async def delete_leave_type(lid: str, user=Depends(require_role("ADMIN"))):
+    if await db.leave_requests.find_one({"leave_type_id": oid(lid)}):
+        raise HTTPException(400, "Există cereri asociate acestui tip")
+    r = await db.leave_types.delete_one({"_id": oid(lid)})
     if r.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Angajat inexistent")
+        raise HTTPException(404, "Tip inexistent")
     return {"ok": True}
 
 
-# ---------- Destinations ----------
-@api.get("/destinations")
-async def list_destinations(tip: Optional[str] = None, user=Depends(get_current_user)):
-    filt = {}
-    if tip:
-        filt["tip"] = tip
-    docs = await db.destinations.find(filt).sort("tara", 1).to_list(1000)
-    return [serialize_doc(d) for d in docs]
-
-
-@api.post("/destinations")
-async def create_destination(body: DestinationIn, user=Depends(get_current_user)):
-    res = await db.destinations.insert_one(body.model_dump())
-    return serialize_doc(await db.destinations.find_one({"_id": res.inserted_id}))
-
-
-@api.put("/destinations/{did}")
-async def update_destination(did: str, body: DestinationIn, user=Depends(get_current_user)):
-    await db.destinations.update_one({"_id": oid(did)}, {"$set": body.model_dump()})
-    return serialize_doc(await db.destinations.find_one({"_id": oid(did)}))
-
-
-@api.delete("/destinations/{did}")
-async def delete_destination(did: str, user=Depends(get_current_user)):
-    # block if packages exist
-    if await db.packages.find_one({"destination_id": oid(did)}):
-        raise HTTPException(status_code=400, detail="Există pachete asociate acestei destinații")
-    r = await db.destinations.delete_one({"_id": oid(did)})
-    if r.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Destinație inexistentă")
-    return {"ok": True}
-
-
-# ---------- Packages ----------
-async def _package_with_dest(p):
-    p = serialize_doc(p)
-    dest = await db.destinations.find_one({"_id": oid(p["destination_id"])})
-    p["destination"] = serialize_doc(dest) if dest else None
-    return p
-
-
-@api.get("/packages")
-async def list_packages(user=Depends(get_current_user)):
-    docs = await db.packages.find({}).sort("denumire", 1).to_list(1000)
-    return [await _package_with_dest(d) for d in docs]
-
-
-@api.post("/packages")
-async def create_package(body: PackageIn, user=Depends(get_current_user)):
-    if not await db.destinations.find_one({"_id": oid(body.destination_id)}):
-        raise HTTPException(status_code=400, detail="Destinație inexistentă")
-    doc = body.model_dump()
-    doc["destination_id"] = oid(doc["destination_id"])
-    res = await db.packages.insert_one(doc)
-    return await _package_with_dest(await db.packages.find_one({"_id": res.inserted_id}))
-
-
-@api.put("/packages/{pid}")
-async def update_package(pid: str, body: PackageIn, user=Depends(get_current_user)):
-    if not await db.destinations.find_one({"_id": oid(body.destination_id)}):
-        raise HTTPException(status_code=400, detail="Destinație inexistentă")
-    doc = body.model_dump()
-    doc["destination_id"] = oid(doc["destination_id"])
-    await db.packages.update_one({"_id": oid(pid)}, {"$set": doc})
-    return await _package_with_dest(await db.packages.find_one({"_id": oid(pid)}))
-
-
-@api.delete("/packages/{pid}")
-async def delete_package(pid: str, user=Depends(get_current_user)):
-    if await db.reservations.find_one({"package_id": oid(pid)}):
-        raise HTTPException(status_code=400, detail="Există rezervări pentru acest pachet")
-    r = await db.packages.delete_one({"_id": oid(pid)})
-    if r.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Pachet inexistent")
-    return {"ok": True}
-
-
-# ---------- Reservations ----------
-async def _reservation_full(r):
-    r = serialize_doc(r)
-    cli = await db.clients.find_one({"_id": oid(r["client_id"])})
-    pkg = await db.packages.find_one({"_id": oid(r["package_id"])})
-    emp = await db.employees.find_one({"_id": oid(r["employee_id"])})
-    r["client"] = serialize_doc(cli) if cli else None
-    r["package"] = await _package_with_dest(pkg) if pkg else None
-    r["employee"] = serialize_doc(emp) if emp else None
-    # aggregate payments
-    pays = await db.payments.find({"reservation_id": oid(r["id"])}).to_list(1000)
-    r["total_platit"] = round(sum(p["suma"] for p in pays), 2)
-    r["sold"] = round(r["valoare"] - r["total_platit"], 2)
+# --------- Leave Requests ---------
+async def _enrich_request(r):
+    r = ser(r)
+    u = await db.users.find_one({"_id": oid(r["empl_id"])})
+    r["employee_name"] = u["name"] if u else "?"
+    r["employee_email"] = u["email"] if u else ""
+    if u and u.get("dept_id"):
+        dep = await db.departments.find_one({"_id": u["dept_id"]})
+        r["department_name"] = dep["department_name"] if dep else None
+        r["dept_id"] = str(u["dept_id"])
+    lt = await db.leave_types.find_one({"_id": oid(r["leave_type_id"])})
+    if lt:
+        r["leave_type_name"] = lt["name"]
+        r["leave_type_code"] = lt["code"]
+        r["leave_type_paid"] = lt.get("paid", True)
+    atts = await db.attachments.find({"leave_request_id": oid(r["id"])}, {"content_base64": 0}).to_list(20)
+    r["attachments"] = [ser(a) for a in atts]
     return r
 
 
-@api.get("/reservations")
-async def list_reservations(user=Depends(get_current_user)):
-    docs = await db.reservations.find({}).sort("data_rezervare", -1).to_list(1000)
-    return [await _reservation_full(d) for d in docs]
+@api.get("/leave-requests")
+async def list_leave_requests(
+    scope: str = "self",  # self | department | all
+    status: Optional[str] = None,
+    user=Depends(get_user),
+):
+    filt = {}
+    if scope == "self":
+        filt["empl_id"] = oid(user["id"])
+    elif scope == "department":
+        if user["role"] not in ("DEPT_RESP", "ADMIN"):
+            raise HTTPException(403, "Doar managerii pot vedea departamentul")
+        if user["role"] == "DEPT_RESP" and user.get("dept_id"):
+            dep_users = await db.users.find({"dept_id": oid(user["dept_id"])}).to_list(500)
+            filt["empl_id"] = {"$in": [u["_id"] for u in dep_users]}
+        elif user["role"] == "DEPT_RESP":
+            filt["empl_id"] = oid(user["id"])
+    elif scope == "all":
+        if user["role"] != "ADMIN":
+            raise HTTPException(403, "Doar administratorii pot vedea toate cererile")
+
+    if status:
+        filt["status"] = status
+    docs = await db.leave_requests.find(filt).sort("created_at", -1).to_list(1000)
+    return [await _enrich_request(d) for d in docs]
 
 
-@api.post("/reservations")
-async def create_reservation(body: ReservationIn, user=Depends(get_current_user)):
-    pkg = await db.packages.find_one({"_id": oid(body.package_id)})
-    if not pkg:
-        raise HTTPException(status_code=400, detail="Pachet inexistent")
-    if not await db.clients.find_one({"_id": oid(body.client_id)}):
-        raise HTTPException(status_code=400, detail="Client inexistent")
-    if not await db.employees.find_one({"_id": oid(body.employee_id)}):
-        raise HTTPException(status_code=400, detail="Angajat inexistent")
+@api.get("/leave-requests/{rid}")
+async def get_leave_request(rid: str, user=Depends(get_user)):
+    r = await db.leave_requests.find_one({"_id": oid(rid)})
+    if not r:
+        raise HTTPException(404, "Cerere inexistentă")
+    # ownership check
+    if user["role"] == "USER" and str(r["empl_id"]) != user["id"]:
+        raise HTTPException(403, "Nu aveți acces la această cerere")
+    return await _enrich_request(r)
 
-    # Atomic decrement locuri_disponibile ensuring enough seats
-    res = await db.packages.update_one(
-        {"_id": oid(body.package_id), "locuri_disponibile": {"$gte": body.numar_persoane}},
-        {"$inc": {"locuri_disponibile": -body.numar_persoane}},
-    )
-    if res.modified_count == 0:
-        raise HTTPException(status_code=400, detail="Locuri insuficiente pentru acest pachet")
 
-    valoare = round(pkg["pret"] * body.numar_persoane, 2)
+@api.get("/leave-requests/{rid}/workflow")
+async def get_workflow(rid: str, user=Depends(get_user)):
+    docs = await db.leave_workflow.find({"leave_request_id": oid(rid)}).sort("changed_at", 1).to_list(200)
+    out = []
+    for d in docs:
+        d = ser(d)
+        u = await db.users.find_one({"_id": oid(d["empl_id"])})
+        d["user_name"] = u["name"] if u else "?"
+        out.append(d)
+    return out
+
+
+async def _log_workflow(rid, empl_id, old, new, comment=None):
+    await db.leave_workflow.insert_one({
+        "leave_request_id": oid(rid),
+        "empl_id": oid(empl_id),
+        "old_status": old,
+        "current_status": new,
+        "comment": comment,
+        "changed_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+@api.post("/leave-requests")
+async def create_leave_request(body: LeaveRequestIn, user=Depends(get_user)):
+    try:
+        sd = date.fromisoformat(body.start_date)
+        ed = date.fromisoformat(body.end_date)
+    except Exception:
+        raise HTTPException(400, "Format dată invalid")
+    if ed < sd:
+        raise HTTPException(400, "Data de sfârșit este anterioară datei de început")
+
+    lt = await db.leave_types.find_one({"_id": oid(body.leave_type_id)})
+    if not lt:
+        raise HTTPException(400, "Tip concediu inexistent")
+
+    wd = calc_working_days(sd, ed)
+    if wd <= 0:
+        raise HTTPException(400, "Perioada nu conține zile lucrătoare")
+
+    # Balance check for paid
+    if lt.get("paid", True):
+        u = await db.users.find_one({"_id": oid(user["id"])})
+        if u.get("available_leave_days", 0) < wd:
+            raise HTTPException(400, f"Sold insuficient: aveți {u.get('available_leave_days',0)} zile disponibile, cerere pentru {wd} zile")
+
+    # Attachment
+    att_doc = None
+    if lt.get("requires_attachment") and body.submit:
+        if not body.attachment or not body.attachment.get("content_base64"):
+            raise HTTPException(400, "Este necesar un atașament pentru acest tip de concediu")
+
+    status = "PENDING" if body.submit else "DRAFT"
     doc = {
-        "client_id": oid(body.client_id),
-        "package_id": oid(body.package_id),
-        "employee_id": oid(body.employee_id),
-        "numar_persoane": body.numar_persoane,
-        "valoare": valoare,
-        "stare": "CONFIRMATA",
-        "data_rezervare": datetime.now(timezone.utc).isoformat(),
+        "empl_id": oid(user["id"]),
+        "leave_type_id": oid(body.leave_type_id),
+        "start_date": body.start_date,
+        "end_date": body.end_date,
+        "working_days": wd,
+        "status": status,
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    ins = await db.reservations.insert_one(doc)
-    return await _reservation_full(await db.reservations.find_one({"_id": ins.inserted_id}))
+    res = await db.leave_requests.insert_one(doc)
+
+    if body.attachment and body.attachment.get("content_base64"):
+        c = body.attachment["content_base64"]
+        # ~2MB base64 = ~2.6M chars
+        if len(c) > 2_800_000:
+            await db.leave_requests.delete_one({"_id": res.inserted_id})
+            raise HTTPException(400, "Fișier prea mare (max 2MB)")
+        await db.attachments.insert_one({
+            "leave_request_id": res.inserted_id,
+            "file_name": body.attachment.get("file_name", "atasament"),
+            "content_base64": c,
+            "uploaded_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+    await _log_workflow(str(res.inserted_id), user["id"], "-", status)
+    return await _enrich_request(await db.leave_requests.find_one({"_id": res.inserted_id}))
 
 
-@api.put("/reservations/{rid}/status")
-async def change_reservation_status(rid: str, body: ReservationStatusIn, user=Depends(get_current_user)):
-    r = await db.reservations.find_one({"_id": oid(rid)})
+@api.put("/leave-requests/{rid}/action")
+async def action_leave_request(rid: str, body: LeaveActionIn, user=Depends(get_user)):
+    r = await db.leave_requests.find_one({"_id": oid(rid)})
     if not r:
-        raise HTTPException(status_code=404, detail="Rezervare inexistentă")
-    old = r["stare"]
-    new = body.stare
-    if old == new:
-        return await _reservation_full(r)
+        raise HTTPException(404, "Cerere inexistentă")
 
-    # Handle seat restoration/deduction transitions
-    if old != "ANULATA" and new == "ANULATA":
-        # restore seats
-        await db.packages.update_one(
-            {"_id": r["package_id"]},
-            {"$inc": {"locuri_disponibile": r["numar_persoane"]}},
-        )
-    elif old == "ANULATA" and new in ("CONFIRMATA", "FINALIZATA"):
-        # try to re-deduct
-        res = await db.packages.update_one(
-            {"_id": r["package_id"], "locuri_disponibile": {"$gte": r["numar_persoane"]}},
-            {"$inc": {"locuri_disponibile": -r["numar_persoane"]}},
-        )
-        if res.modified_count == 0:
-            raise HTTPException(status_code=400, detail="Locuri insuficiente pentru reactivare")
+    old_status = r["status"]
+    new_status = None
+    action = body.action.upper()
 
-    await db.reservations.update_one({"_id": oid(rid)}, {"$set": {"stare": new}})
-    return await _reservation_full(await db.reservations.find_one({"_id": oid(rid)}))
+    if action == "SUBMIT":  # DRAFT -> PENDING (by owner)
+        if str(r["empl_id"]) != user["id"]:
+            raise HTTPException(403, "Doar proprietarul poate trimite cererea")
+        if old_status != "DRAFT":
+            raise HTTPException(400, "Doar ciornele pot fi trimise")
+        new_status = "PENDING"
+    elif action == "CANCEL":
+        if str(r["empl_id"]) != user["id"] and user["role"] != "ADMIN":
+            raise HTTPException(403, "Doar proprietarul (sau admin) poate anula")
+        if old_status not in ("DRAFT", "PENDING"):
+            raise HTTPException(400, "Doar cererile ne-aprobate pot fi anulate")
+        new_status = "CANCELLED"
+    elif action == "APPROVE":
+        if user["role"] not in ("DEPT_RESP", "ADMIN"):
+            raise HTTPException(403, "Doar managerii pot aproba")
+        if old_status != "PENDING":
+            raise HTTPException(400, "Doar cererile în așteptare pot fi aprobate")
+        # Ensure manager owns the department (unless ADMIN)
+        emp = await db.users.find_one({"_id": r["empl_id"]})
+        if user["role"] == "DEPT_RESP" and emp and str(emp.get("dept_id")) != user.get("dept_id"):
+            raise HTTPException(403, "Angajatul nu este din departamentul dvs.")
+        # Deduct balance if paid
+        lt = await db.leave_types.find_one({"_id": r["leave_type_id"]})
+        if lt and lt.get("paid", True):
+            u2 = await db.users.find_one({"_id": r["empl_id"]})
+            if u2.get("available_leave_days", 0) < r["working_days"]:
+                raise HTTPException(400, "Sold insuficient pentru angajat")
+            await db.users.update_one({"_id": r["empl_id"]}, {"$inc": {"available_leave_days": -r["working_days"]}})
+        new_status = "APPROVED"
+    elif action == "REJECT":
+        if user["role"] not in ("DEPT_RESP", "ADMIN"):
+            raise HTTPException(403, "Doar managerii pot respinge")
+        if old_status != "PENDING":
+            raise HTTPException(400, "Doar cererile în așteptare pot fi respinse")
+        if not body.comment or not body.comment.strip():
+            raise HTTPException(400, "Un motiv de respingere este obligatoriu")
+        new_status = "REJECTED"
+    else:
+        raise HTTPException(400, "Acțiune invalidă")
+
+    await db.leave_requests.update_one({"_id": oid(rid)}, {"$set": {"status": new_status}})
+    await _log_workflow(rid, user["id"], old_status, new_status, body.comment)
+    return await _enrich_request(await db.leave_requests.find_one({"_id": oid(rid)}))
 
 
-@api.delete("/reservations/{rid}")
-async def delete_reservation(rid: str, user=Depends(get_current_user)):
-    r = await db.reservations.find_one({"_id": oid(rid)})
+@api.delete("/leave-requests/{rid}")
+async def delete_leave_request(rid: str, user=Depends(require_role("ADMIN"))):
+    r = await db.leave_requests.find_one({"_id": oid(rid)})
     if not r:
-        raise HTTPException(status_code=404, detail="Rezervare inexistentă")
-    # restore seats if not cancelled
-    if r["stare"] != "ANULATA":
-        await db.packages.update_one(
-            {"_id": r["package_id"]},
-            {"$inc": {"locuri_disponibile": r["numar_persoane"]}},
-        )
-    await db.payments.delete_many({"reservation_id": oid(rid)})
-    await db.reservations.delete_one({"_id": oid(rid)})
+        raise HTTPException(404, "Cerere inexistentă")
+    if r["status"] == "APPROVED":
+        lt = await db.leave_types.find_one({"_id": r["leave_type_id"]})
+        if lt and lt.get("paid", True):
+            await db.users.update_one({"_id": r["empl_id"]}, {"$inc": {"available_leave_days": r["working_days"]}})
+    await db.attachments.delete_many({"leave_request_id": oid(rid)})
+    await db.leave_workflow.delete_many({"leave_request_id": oid(rid)})
+    await db.leave_requests.delete_one({"_id": oid(rid)})
     return {"ok": True}
 
 
-# ---------- Payments ----------
-async def _payment_full(p):
-    p = serialize_doc(p)
-    r = await db.reservations.find_one({"_id": oid(p["reservation_id"])})
-    if r:
-        c = await db.clients.find_one({"_id": r["client_id"]})
-        p["reservation"] = {
-            "id": str(r["_id"]),
-            "valoare": r["valoare"],
-            "client_nume": f"{c['nume']} {c['prenume']}" if c else "-",
+# --------- Attachments ---------
+@api.get("/attachments/{aid}")
+async def get_attachment(aid: str, user=Depends(get_user)):
+    a = await db.attachments.find_one({"_id": oid(aid)})
+    if not a:
+        raise HTTPException(404, "Atașament inexistent")
+    return {"id": str(a["_id"]), "file_name": a["file_name"], "content_base64": a["content_base64"]}
+
+
+# --------- Working Days Preview ---------
+@api.get("/leave-requests/preview/working-days")
+async def preview_working_days(start_date: str, end_date: str, user=Depends(get_user)):
+    try:
+        sd = date.fromisoformat(start_date)
+        ed = date.fromisoformat(end_date)
+    except Exception:
+        raise HTTPException(400, "Format dată invalid")
+    return {"working_days": calc_working_days(sd, ed)}
+
+
+# --------- Calendar (approved requests) ---------
+@api.get("/calendar")
+async def calendar(start: str, end: str, dept_id: Optional[str] = None, user=Depends(get_user)):
+    try:
+        _sd = date.fromisoformat(start)
+        _ed = date.fromisoformat(end)
+    except Exception:
+        raise HTTPException(400, "Date invalide")
+    filt = {"status": {"$in": ["APPROVED", "PENDING"]},
+            "start_date": {"$lte": end}, "end_date": {"$gte": start}}
+    # scope
+    if user["role"] == "USER":
+        # only own dept approved
+        if user.get("dept_id"):
+            dep_users = await db.users.find({"dept_id": oid(user["dept_id"])}).to_list(500)
+            filt["empl_id"] = {"$in": [u["_id"] for u in dep_users]}
+    elif user["role"] == "DEPT_RESP":
+        if user.get("dept_id"):
+            dep_users = await db.users.find({"dept_id": oid(user["dept_id"])}).to_list(500)
+            filt["empl_id"] = {"$in": [u["_id"] for u in dep_users]}
+    elif user["role"] == "ADMIN" and dept_id:
+        dep_users = await db.users.find({"dept_id": oid(dept_id)}).to_list(500)
+        filt["empl_id"] = {"$in": [u["_id"] for u in dep_users]}
+    docs = await db.leave_requests.find(filt).to_list(500)
+    return [await _enrich_request(d) for d in docs]
+
+
+# --------- Reports / Dashboard ---------
+@api.get("/dashboard")
+async def dashboard(user=Depends(get_user)):
+    role = user["role"]
+    result = {"role": role}
+
+    if role == "USER":
+        u = await db.users.find_one({"_id": oid(user["id"])})
+        result["balance"] = {
+            "annual": u.get("annual_leave_days", 0),
+            "available": u.get("available_leave_days", 0),
+            "consumed": u.get("annual_leave_days", 0) - u.get("available_leave_days", 0),
         }
-    return p
+        pipeline = [{"$match": {"empl_id": oid(user["id"])}},
+                    {"$group": {"_id": "$status", "count": {"$sum": 1}}}]
+        by_status = await db.leave_requests.aggregate(pipeline).to_list(50)
+        result["by_status"] = [{"status": r["_id"], "count": r["count"]} for r in by_status]
+        recent = await db.leave_requests.find({"empl_id": oid(user["id"])}).sort("created_at", -1).limit(5).to_list(5)
+        result["recent"] = [await _enrich_request(r) for r in recent]
+
+    elif role == "DEPT_RESP":
+        dep_users = await db.users.find({"dept_id": oid(user["dept_id"])}).to_list(500) if user.get("dept_id") else []
+        emp_ids = [u["_id"] for u in dep_users]
+        pending = await db.leave_requests.count_documents({"empl_id": {"$in": emp_ids}, "status": "PENDING"})
+        approved = await db.leave_requests.count_documents({"empl_id": {"$in": emp_ids}, "status": "APPROVED"})
+        today = date.today().isoformat()
+        absent_today = await db.leave_requests.count_documents({
+            "empl_id": {"$in": emp_ids}, "status": "APPROVED",
+            "start_date": {"$lte": today}, "end_date": {"$gte": today}
+        })
+        dept = await db.departments.find_one({"_id": oid(user["dept_id"])}) if user.get("dept_id") else None
+        result["kpi"] = {
+            "team_size": len(dep_users),
+            "pending": pending,
+            "approved": approved,
+            "absent_today": absent_today,
+            "max_absent": dept.get("max_absent_employees") if dept else None,
+        }
+        pending_docs = await db.leave_requests.find({"empl_id": {"$in": emp_ids}, "status": "PENDING"}).sort("created_at", -1).limit(10).to_list(10)
+        result["pending_list"] = [await _enrich_request(r) for r in pending_docs]
+
+    elif role == "ADMIN":
+        total_users = await db.users.count_documents({})
+        total_pending = await db.leave_requests.count_documents({"status": "PENDING"})
+        total_approved = await db.leave_requests.count_documents({"status": "APPROVED"})
+        total_depts = await db.departments.count_documents({})
+        result["kpi"] = {
+            "total_users": total_users,
+            "total_departments": total_depts,
+            "pending": total_pending,
+            "approved": total_approved,
+        }
+        # per department
+        depts = await db.departments.find({}).to_list(100)
+        per_dept = []
+        for d in depts:
+            dep_users = await db.users.find({"dept_id": d["_id"]}).to_list(500)
+            emp_ids = [u["_id"] for u in dep_users]
+            p = await db.leave_requests.count_documents({"empl_id": {"$in": emp_ids}, "status": "PENDING"})
+            a = await db.leave_requests.count_documents({"empl_id": {"$in": emp_ids}, "status": "APPROVED"})
+            per_dept.append({
+                "department": d["department_name"],
+                "employees": len(dep_users),
+                "pending": p,
+                "approved": a,
+            })
+        result["per_department"] = per_dept
+
+        # per leave type
+        pipeline = [{"$match": {"status": "APPROVED"}},
+                    {"$group": {"_id": "$leave_type_id", "total_days": {"$sum": "$working_days"}, "count": {"$sum": 1}}}]
+        agg = await db.leave_requests.aggregate(pipeline).to_list(50)
+        per_type = []
+        for r in agg:
+            lt = await db.leave_types.find_one({"_id": r["_id"]})
+            per_type.append({"code": lt["code"] if lt else "?", "name": lt["name"] if lt else "?",
+                             "total_days": r["total_days"], "count": r["count"]})
+        result["per_leave_type"] = per_type
+
+    return result
 
 
-@api.get("/payments")
-async def list_payments(user=Depends(get_current_user)):
-    docs = await db.payments.find({}).sort("data_plata", -1).to_list(1000)
-    return [await _payment_full(d) for d in docs]
-
-
-@api.post("/payments")
-async def create_payment(body: PaymentIn, user=Depends(get_current_user)):
-    r = await db.reservations.find_one({"_id": oid(body.reservation_id)})
+# --------- PDF Export ---------
+@api.get("/leave-requests/{rid}/pdf")
+async def export_pdf(rid: str, user=Depends(get_user)):
+    r = await db.leave_requests.find_one({"_id": oid(rid)})
     if not r:
-        raise HTTPException(status_code=400, detail="Rezervare inexistentă")
-    # compute sold
-    pays = await db.payments.find({"reservation_id": r["_id"]}).to_list(1000)
-    total = sum(p["suma"] for p in pays)
-    sold = r["valoare"] - total
-    if body.suma > sold + 0.01:
-        raise HTTPException(status_code=400, detail=f"Suma depășește soldul rămas ({sold:.2f} RON)")
-    doc = {
-        "reservation_id": r["_id"],
-        "suma": round(body.suma, 2),
-        "metoda": body.metoda,
-        "data_plata": datetime.now(timezone.utc).isoformat(),
-    }
-    ins = await db.payments.insert_one(doc)
-    return await _payment_full(await db.payments.find_one({"_id": ins.inserted_id}))
+        raise HTTPException(404, "Cerere inexistentă")
+    if user["role"] == "USER" and str(r["empl_id"]) != user["id"]:
+        raise HTTPException(403, "Fără acces")
+    if r["status"] != "APPROVED":
+        raise HTTPException(400, "PDF disponibil doar pentru cereri aprobate")
 
-
-@api.delete("/payments/{pid}")
-async def delete_payment(pid: str, user=Depends(get_current_user)):
-    r = await db.payments.delete_one({"_id": oid(pid)})
-    if r.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Plată inexistentă")
-    return {"ok": True}
-
-
-# ---------- Reports & Dashboard ----------
-@api.get("/reports/dashboard")
-async def dashboard(user=Depends(get_current_user)):
-    total_reservations = await db.reservations.count_documents({})
-    active_clients = await db.clients.count_documents({"statut": "ACTIV"})
-    total_packages = await db.packages.count_documents({})
-
-    pays = await db.payments.find({}).to_list(10000)
-    total_revenue = round(sum(p["suma"] for p in pays), 2)
-
-    # reservations per client
-    pipeline_rc = [
-        {"$group": {"_id": "$client_id", "count": {"$sum": 1}, "total": {"$sum": "$valoare"}}},
-        {"$sort": {"count": -1}},
-        {"$limit": 8},
+    enr = await _enrich_request(r)
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=2 * cm, bottomMargin=2 * cm)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle('t', parent=styles['Title'], fontSize=16, textColor=colors.HexColor("#0f172a"))
+    h_style = ParagraphStyle('h', parent=styles['Normal'], fontSize=10, textColor=colors.HexColor("#64748b"))
+    body = []
+    body.append(Paragraph("DRAXLMAIER — Employee Leave Hub", title_style))
+    body.append(Paragraph("Cerere de concediu aprobată", h_style))
+    body.append(Spacer(1, 0.7 * cm))
+    tbl_data = [
+        ["Angajat", enr["employee_name"]],
+        ["Email", enr["employee_email"]],
+        ["Departament", enr.get("department_name") or "-"],
+        ["Tip concediu", f"{enr.get('leave_type_name')} ({enr.get('leave_type_code')})"],
+        ["Dată început", enr["start_date"]],
+        ["Dată sfârșit", enr["end_date"]],
+        ["Zile lucrătoare", str(enr["working_days"])],
+        ["Status", enr["status"]],
+        ["Creat la", enr["created_at"][:10]],
     ]
-    rc = await db.reservations.aggregate(pipeline_rc).to_list(100)
-    reservations_per_client = []
-    for r in rc:
-        c = await db.clients.find_one({"_id": r["_id"]})
-        if c:
-            reservations_per_client.append({
-                "client": f"{c['nume']} {c['prenume']}",
-                "count": r["count"],
-                "total": round(r["total"], 2),
-            })
-
-    # popular packages
-    pipeline_pp = [
-        {"$group": {"_id": "$package_id", "count": {"$sum": 1}, "persoane": {"$sum": "$numar_persoane"}}},
-        {"$sort": {"count": -1}},
-        {"$limit": 8},
-    ]
-    pp = await db.reservations.aggregate(pipeline_pp).to_list(100)
-    popular_packages = []
-    for r in pp:
-        p = await db.packages.find_one({"_id": r["_id"]})
-        if p:
-            popular_packages.append({
-                "denumire": p["denumire"],
-                "count": r["count"],
-                "persoane": r["persoane"],
-            })
-
-    # revenue per method
-    pipeline_rm = [
-        {"$group": {"_id": "$metoda", "total": {"$sum": "$suma"}, "count": {"$sum": 1}}},
-    ]
-    rm = await db.payments.aggregate(pipeline_rm).to_list(100)
-    revenue_by_method = [{"metoda": r["_id"], "total": round(r["total"], 2), "count": r["count"]} for r in rm]
-
-    return {
-        "kpi": {
-            "total_reservations": total_reservations,
-            "total_revenue": total_revenue,
-            "active_clients": active_clients,
-            "total_packages": total_packages,
-        },
-        "reservations_per_client": reservations_per_client,
-        "popular_packages": popular_packages,
-        "revenue_by_method": revenue_by_method,
-    }
+    t = Table(tbl_data, colWidths=[5 * cm, 11 * cm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#f1f5f9")),
+        ("TEXTCOLOR", (0, 0), (-1, -1), colors.HexColor("#0f172a")),
+        ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#e2e8f0")),
+    ]))
+    body.append(t)
+    body.append(Spacer(1, 1 * cm))
+    body.append(Paragraph("Această cerere a fost aprobată electronic în platforma DRAXLMAIER Employee Leave Hub.", h_style))
+    body.append(Spacer(1, 2 * cm))
+    body.append(Paragraph(f"Data emiterii documentului: {date.today().isoformat()}", h_style))
+    doc.build(body)
+    pdf = buf.getvalue()
+    buf.close()
+    return Response(content=pdf, media_type="application/pdf",
+                    headers={"Content-Disposition": f'attachment; filename="cerere_{rid[:8]}.pdf"'})
 
 
-@api.get("/reports/detailed")
-async def detailed_report(user=Depends(get_current_user)):
-    docs = await db.reservations.find({}).sort("data_rezervare", -1).to_list(1000)
-    return [await _reservation_full(d) for d in docs]
-
-
-# ---------- Seed ----------
+# --------- Seed ---------
 async def seed_admin():
-    email = os.environ.get("ADMIN_EMAIL", "admin@turism.ro").lower()
-    pwd = os.environ.get("ADMIN_PASSWORD", "admin123")
+    email = os.environ.get("ADMIN_EMAIL").lower()
+    pwd = os.environ.get("ADMIN_PASSWORD")
     existing = await db.users.find_one({"email": email})
     if not existing:
         await db.users.insert_one({
             "email": email,
             "password_hash": hash_password(pwd),
-            "nume": "Administrator",
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "name": "Administrator Sistem",
+            "role": "ADMIN",
+            "dept_id": None,
+            "annual_leave_days": 25,
+            "available_leave_days": 25,
         })
-        logger.info(f"Seeded admin: {email}")
-    elif not verify_password(pwd, existing["password_hash"]):
-        await db.users.update_one({"email": email}, {"$set": {"password_hash": hash_password(pwd)}})
-        logger.info(f"Updated admin password: {email}")
+        log.info(f"Admin seeded: {email}")
 
 
-async def seed_demo_data(force: bool = False):
-    if not force and await db.clients.count_documents({}) > 0:
-        return {"skipped": True}
+async def seed_demo():
+    if await db.leave_types.count_documents({}) > 0:
+        return
+    # Departments
+    depts_data = [
+        {"department_name": "IT", "max_absent_employees": 2},
+        {"department_name": "HR", "max_absent_employees": 1},
+        {"department_name": "Producție", "max_absent_employees": 3},
+        {"department_name": "Logistică", "max_absent_employees": 2},
+    ]
+    d_res = await db.departments.insert_many(depts_data)
+    d_ids = d_res.inserted_ids
+    it_id, hr_id, prod_id, log_id = d_ids
 
-    # clear
-    for c in ("clients", "employees", "destinations", "packages", "reservations", "payments"):
-        await db[c].delete_many({})
+    # Managers
+    mgrs = [
+        {"name": "Mihai Constantin", "email": "manager.it@draxlmaier.ro", "role": "DEPT_RESP", "dept_id": it_id},
+        {"name": "Andreea Radu", "email": "manager.hr@draxlmaier.ro", "role": "DEPT_RESP", "dept_id": hr_id},
+        {"name": "Cristian Munteanu", "email": "manager.prod@draxlmaier.ro", "role": "DEPT_RESP", "dept_id": prod_id},
+    ]
+    for m in mgrs:
+        m["password_hash"] = hash_password("parola123")
+        m["annual_leave_days"] = 25
+        m["available_leave_days"] = 25
+    m_res = await db.users.insert_many(mgrs)
+    mit, mhr, mprod = m_res.inserted_ids
 
-    now_iso = datetime.now(timezone.utc).isoformat()
-
-    # Clients
-    ro_first = ["Andrei", "Maria", "Ion", "Elena", "Vlad", "Ana", "Radu", "Ioana", "Mihai", "Cristina"]
-    ro_last = ["Popescu", "Ionescu", "Georgescu", "Dumitrescu", "Stan", "Marin", "Radu", "Popa", "Constantin", "Munteanu"]
-    clients_docs = []
-    for i in range(10):
-        clients_docs.append({
-            "nume": ro_last[i],
-            "prenume": ro_first[i],
-            "email": f"{ro_first[i].lower()}.{ro_last[i].lower()}@example.com",
-            "telefon": f"07{random.randint(10000000, 99999999)}",
-            "data_inregistrarii": now_iso,
-            "statut": random.choice(["ACTIV", "ACTIV", "ACTIV", "INACTIV"]),
-        })
-    cli_res = await db.clients.insert_many(clients_docs)
-    cli_ids = cli_res.inserted_ids
+    # Update department managers
+    await db.departments.update_one({"_id": it_id}, {"$set": {"manager_id": mit}})
+    await db.departments.update_one({"_id": hr_id}, {"$set": {"manager_id": mhr}})
+    await db.departments.update_one({"_id": prod_id}, {"$set": {"manager_id": mprod}})
 
     # Employees
-    functii = ["Agent turism", "Manager", "Consilier", "Contabil", "Rezervări"]
-    employees_docs = []
-    for i in range(5):
-        employees_docs.append({
-            "nume": ro_last[i + 3],
-            "prenume": ro_first[i + 2],
-            "functie": functii[i],
-            "salariu": float(random.randint(2500, 8000)),
-            "data_angajarii": (datetime.now(timezone.utc) - timedelta(days=random.randint(100, 2000))).date().isoformat(),
-        })
-    emp_res = await db.employees.insert_many(employees_docs)
-    emp_ids = emp_res.inserted_ids
-
-    # Destinations
-    destinations_docs = [
-        {"tara": "Grecia", "oras": "Santorini", "tip": "MARE"},
-        {"tara": "Franța", "oras": "Chamonix", "tip": "MUNTE"},
-        {"tara": "Italia", "oras": "Roma", "tip": "CITY BREAK"},
-        {"tara": "Egipt", "oras": "Hurghada", "tip": "MARE"},
-        {"tara": "Turcia", "oras": "Istanbul", "tip": "CULTURAL"},
+    emps = [
+        {"name": "Ion Popescu", "email": "ion.popescu@draxlmaier.ro", "dept_id": it_id},
+        {"name": "Maria Ionescu", "email": "maria.ionescu@draxlmaier.ro", "dept_id": it_id},
+        {"name": "Andrei Marin", "email": "andrei.marin@draxlmaier.ro", "dept_id": hr_id},
+        {"name": "Elena Stan", "email": "elena.stan@draxlmaier.ro", "dept_id": prod_id},
+        {"name": "Vlad Dumitrescu", "email": "vlad.dumitrescu@draxlmaier.ro", "dept_id": prod_id},
     ]
-    dest_res = await db.destinations.insert_many(destinations_docs)
-    dest_ids = dest_res.inserted_ids
-
-    # Packages
-    packages_docs = [
-        {"destination_id": dest_ids[0], "denumire": "Santorini Sunset 7 zile", "pret": 3200.0, "zile": 7, "locuri_disponibile": 20},
-        {"destination_id": dest_ids[0], "denumire": "Santorini All-Inclusive 5 zile", "pret": 2500.0, "zile": 5, "locuri_disponibile": 15},
-        {"destination_id": dest_ids[1], "denumire": "Chamonix Ski 6 zile", "pret": 4500.0, "zile": 6, "locuri_disponibile": 12},
-        {"destination_id": dest_ids[2], "denumire": "Roma City Break 4 zile", "pret": 1800.0, "zile": 4, "locuri_disponibile": 25},
-        {"destination_id": dest_ids[2], "denumire": "Roma Cultural 7 zile", "pret": 2900.0, "zile": 7, "locuri_disponibile": 18},
-        {"destination_id": dest_ids[3], "denumire": "Hurghada Resort 10 zile", "pret": 3800.0, "zile": 10, "locuri_disponibile": 30},
-        {"destination_id": dest_ids[4], "denumire": "Istanbul Cultural 5 zile", "pret": 2100.0, "zile": 5, "locuri_disponibile": 22},
-        {"destination_id": dest_ids[4], "denumire": "Istanbul Weekend 3 zile", "pret": 1200.0, "zile": 3, "locuri_disponibile": 28},
-    ]
-    pkg_res = await db.packages.insert_many(packages_docs)
-    pkg_ids = pkg_res.inserted_ids
-
-    # Reservations (10) - decrement seats accordingly
-    reservations_docs = []
-    for i in range(10):
-        pkg_idx = i % len(pkg_ids)
-        persoane = random.randint(1, 4)
-        pkg = packages_docs[pkg_idx]
-        if pkg["locuri_disponibile"] < persoane:
-            persoane = pkg["locuri_disponibile"]
-        if persoane == 0:
-            continue
-        pkg["locuri_disponibile"] -= persoane
-        stare = random.choice(["CONFIRMATA", "CONFIRMATA", "FINALIZATA", "ANULATA"])
-        # Reflect seat restoration for ANULATA
-        if stare == "ANULATA":
-            pkg["locuri_disponibile"] += persoane
-        reservations_docs.append({
-            "client_id": cli_ids[i % len(cli_ids)],
-            "package_id": pkg_ids[pkg_idx],
-            "employee_id": emp_ids[i % len(emp_ids)],
-            "numar_persoane": persoane,
-            "valoare": round(pkg["pret"] * persoane, 2),
-            "stare": stare,
-            "data_rezervare": (datetime.now(timezone.utc) - timedelta(days=random.randint(1, 60))).isoformat(),
+    for e in emps:
+        e.update({
+            "role": "USER",
+            "password_hash": hash_password("parola123"),
+            "annual_leave_days": 21,
+            "available_leave_days": 21,
         })
-    # Update packages with new seat counts
-    for i, pid in enumerate(pkg_ids):
-        await db.packages.update_one({"_id": pid}, {"$set": {"locuri_disponibile": packages_docs[i]["locuri_disponibile"]}})
+    await db.users.insert_many(emps)
 
-    if reservations_docs:
-        rez_res = await db.reservations.insert_many(reservations_docs)
-        rez_ids = rez_res.inserted_ids
+    # Leave types
+    lts = [
+        {"name": "Concediu de Odihnă", "code": "CO", "requires_attachment": False, "paid": True},
+        {"name": "Concediu Medical", "code": "CM", "requires_attachment": True, "paid": True},
+        {"name": "Concediu fără Plată", "code": "FP", "requires_attachment": False, "paid": False},
+        {"name": "Eveniment Special", "code": "SPECIAL", "requires_attachment": False, "paid": True},
+    ]
+    await db.leave_types.insert_many(lts)
 
-        # Payments (some full, some partial)
-        payments_docs = []
-        methods = ["CARD", "CASH", "TRANSFER"]
-        for i, rid in enumerate(rez_ids):
-            r = reservations_docs[i]
-            if r["stare"] == "ANULATA":
-                continue
-            if r["stare"] == "FINALIZATA":
-                # full payment
-                payments_docs.append({
-                    "reservation_id": rid,
-                    "suma": r["valoare"],
-                    "metoda": random.choice(methods),
-                    "data_plata": (datetime.now(timezone.utc) - timedelta(days=random.randint(1, 30))).isoformat(),
-                })
-            else:
-                # partial ~50%
-                half = round(r["valoare"] / 2, 2)
-                payments_docs.append({
-                    "reservation_id": rid,
-                    "suma": half,
-                    "metoda": random.choice(methods),
-                    "data_plata": (datetime.now(timezone.utc) - timedelta(days=random.randint(1, 30))).isoformat(),
-                })
-        if payments_docs:
-            await db.payments.insert_many(payments_docs)
-
-    return {"ok": True, "clients": len(cli_ids), "reservations": len(reservations_docs)}
-
-
-@api.post("/seed")
-async def reseed(user=Depends(get_current_user)):
-    return await seed_demo_data(force=True)
+    log.info("Demo seeded")
 
 
 @api.get("/")
 async def root():
-    return {"message": "Turism API"}
+    return {"message": "Employee Leave Hub API"}
 
 
-# ---------- Startup ----------
 @app.on_event("startup")
 async def startup():
     await db.users.create_index("email", unique=True)
-    await db.clients.create_index("email", unique=True)
+    await db.leave_types.create_index("code", unique=True)
     await seed_admin()
-    await seed_demo_data(force=False)
+    await seed_demo()
 
 
 @app.on_event("shutdown")
